@@ -133,17 +133,15 @@ class LoRAsub_DRS(BaseLearner):
 
                 for module in self._network.modules():
                     if isinstance(module, Attention_LoRA):
-                        self.fea_in[module.lora_A_k[self._cur_task].weight] = deepcopy(module.cur_matrix).to(
-                            self._device)
-                        self.fea_in[module.lora_A_v[self._cur_task].weight] = deepcopy(module.cur_matrix).to(
-                            self._device)
-                        self.fea_in[module.lora_B_k[self._cur_task].weight] = deepcopy(module.cur_matrix).to(
-                            self._device)
-                        self.fea_in[module.lora_B_v[self._cur_task].weight] = deepcopy(module.cur_matrix).to(
-                            self._device)
-                        module.cur_matrix.zero_()
+                        shared_matrix = module.compute_shared_features(self._cur_task)
+                        module.apply_shared_subtraction(self._cur_task, shared_matrix)
+                        shared_tensor = deepcopy(module.cur_matrix)
+                        self.fea_in[module.lora_A_k[self._cur_task].weight] = shared_tensor.to(self._device)
+                        self.fea_in[module.lora_A_v[self._cur_task].weight] = deepcopy(module.cur_matrix).to(self._device)
+                        self.fea_in[module.lora_B_k[self._cur_task].weight] = deepcopy(module.cur_matrix).to(self._device)
+                        self.fea_in[module.lora_B_v[self._cur_task].weight] = deepcopy(module.cur_matrix).to(self._device)
+                        module.register_shared_state()
                         module.matrix_kv = 0
-                        module.n_cur_matrix = 0
 
             self.init_model_optimizer()
             if self._cur_task == 0:
