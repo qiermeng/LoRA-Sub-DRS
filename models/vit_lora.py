@@ -206,6 +206,10 @@ class Attention_LoRA(nn.Module):
         self.initlora_B_k = torch.zeros(r, dim)
         self.initlora_B_v = torch.zeros(r, dim)
 
+        self.prev_matrix = None
+        self.shared_feature_matrix = None
+        self._shared_eps = 1e-6
+
 
     def init_param(self):
         for t in range(len(self.lora_A_k)):
@@ -238,6 +242,66 @@ class Attention_LoRA(nn.Module):
 
     def get_attention_map(self):
         return self.attention_map
+
+    def compute_shared_features(self, task_idx):
+        """Estimate the shared feature matrix between previous and current tasks.
+
+        The shared matrix is computed by aligning the averaged low-rank
+        reconstruction of the previous tasks with the current task activation
+        statistics captured in ``self.cur_matrix``. We normalise both sides with
+        their Frobenius norm to avoid scale mismatch and employ an element-wise
+        product to retain features that are consistently high on both sides.
+        """
+        if task_idx <= 0 or self.n_cur_matrix == 0:
+            self.shared_feature_matrix = None
+            return None
+
+        weight_k_old = torch.stack(
+            [torch.mm(self.lora_B_k[t].weight.detach(), self.lora_A_k[t].weight.detach()) for t in range(task_idx)],
+            dim=0).mean(dim=0)
+        weight_v_old = torch.stack(
+            [torch.mm(self.lora_B_v[t].weight.detach(), self.lora_A_v[t].weight.detach()) for t in range(task_idx)],
+            dim=0).mean(dim=0)
+
+        reference_matrix = 0.5 * (weight_k_old + weight_v_old).cpu()
+        current_matrix = self.cur_matrix.clone()
+
+        reference_matrix = reference_matrix / (reference_matrix.norm(p='fro') + self._shared_eps)
+        current_matrix = current_matrix / (current_matrix.norm(p='fro') + self._shared_eps)
+
+        if self.prev_matrix is not None:
+            prev_matrix = self.prev_matrix / (self.prev_matrix.norm(p='fro') + self._shared_eps)
+            reference_matrix = 0.5 * (reference_matrix + prev_matrix)
+
+        shared_matrix = reference_matrix * current_matrix
+        self.shared_feature_matrix = shared_matrix
+        return shared_matrix
+
+    def apply_shared_subtraction(self, task_idx, shared_matrix):
+        """Apply the LoRA subtraction guided by the shared feature matrix."""
+        if shared_matrix is None or task_idx <= 0:
+            return
+
+        device = self.lora_A_k[task_idx].weight.device
+        shared_matrix = shared_matrix.to(device)
+
+        with torch.no_grad():
+            A_old_k = torch.stack([self.lora_A_k[t].weight.detach() for t in range(task_idx)], dim=0).mean(dim=0)
+            B_old_k = torch.stack([self.lora_B_k[t].weight.detach() for t in range(task_idx)], dim=0).mean(dim=0)
+            A_old_v = torch.stack([self.lora_A_v[t].weight.detach() for t in range(task_idx)], dim=0).mean(dim=0)
+            B_old_v = torch.stack([self.lora_B_v[t].weight.detach() for t in range(task_idx)], dim=0).mean(dim=0)
+
+            self.lora_A_k[task_idx].weight.data -= torch.matmul(A_old_k, shared_matrix)
+            self.lora_B_k[task_idx].weight.data -= torch.matmul(shared_matrix, B_old_k)
+            self.lora_A_v[task_idx].weight.data -= torch.matmul(A_old_v, shared_matrix)
+            self.lora_B_v[task_idx].weight.data -= torch.matmul(shared_matrix, B_old_v)
+
+    def register_shared_state(self):
+        """Persist the current covariance statistics for the next task."""
+        if self.n_cur_matrix > 0:
+            self.prev_matrix = self.cur_matrix.clone()
+        self.cur_matrix.zero_()
+        self.n_cur_matrix = 0
 
     # feature
 
